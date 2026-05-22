@@ -4,6 +4,11 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const cors = require('cors');
 const path = require('path');
+const {
+  extractComicsFromPage,
+  fetchKomikuPage,
+  fetchComicsFromUrl,
+} = require('./scraper-utils');
 
 const app = express();
 
@@ -14,6 +19,15 @@ app.use(express.json());
 // Simple in-memory cache (untuk production sebaiknya gunakan Redis)
 const cache = new Map();
 const CACHE_DURATION = 5 * 60 * 1000; // 5 menit
+
+function getApiBase(req) {
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+  if (req?.headers?.host) {
+    const proto = req.headers['x-forwarded-proto'] || 'http';
+    return `${proto}://${req.headers.host}`;
+  }
+  return `http://localhost:${process.env.PORT || 3000}`;
+}
 
 // Cache middleware
 function cacheMiddleware(duration = CACHE_DURATION) {
@@ -492,38 +506,13 @@ app.get('/api/realtime', async (req, res) => {
     
     const fetchPromises = sources.map(async (source) => {
       try {
-        const response = await axios.get(source.url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-          },
-          timeout: 8000
-        });
-        const $ = cheerio.load(response.data);
-        const comics = [];
-
-        $('.ls4, .bge, .bgei, .ltst, article.post').each((i, el) => {
-          const $el = $(el);
-          const title = $el.find('h3 a, h4 a, .title a, .entry-title a').text().trim();
-          const link = $el.find('h3 a, h4 a, .title a, .entry-title a').attr('href');
-          const image = $el.find('img').attr('src') || 
-                       $el.find('img').attr('data-src') || 
-                       $el.find('img').attr('data-lazy-src');
-          const chapter = $el.find('.chapter, .ls24, .new-chapter, .latest').text().trim();
-          const rating = $el.find('.rating, .score').text().trim();
-          
-          if (title && link && image) {
-            comics.push({
-              title,
-              link,
-              image,
-              chapter: chapter || 'Latest',
-              rating: rating || null,
-              source_priority: source.priority,
-              source_url: source.url
-            });
-          }
-        });
+        const $ = await fetchKomikuPage(source.url, 8000);
+        const comics = extractComicsFromPage($).map((comic) => ({
+          ...comic,
+          rating: null,
+          source_priority: source.priority,
+          source_url: source.url,
+        }));
         
         return comics;
       } catch (error) {
@@ -699,74 +688,21 @@ app.get('/api/unlimited', async (req, res) => {
     const fetchWithMultipleSelectors = async (url, retries = 2) => {
       for (let i = 0; i <= retries; i++) {
         try {
-          const response = await axios.get(url, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-              'Accept-Language': 'en-US,en;q=0.5',
-              'Accept-Encoding': 'gzip, deflate, br',
-              'Connection': 'keep-alive'
-            },
-            timeout: 12000
-          });
-          
-          const $ = cheerio.load(response.data);
-          const comics = [];
-
-          const selectors = [
-            'article.ls4',    // Main comic articles
-            '.ls4',          // Alternative ls4 elements  
-            '.bge',          // Grid layout
-            '.bgei'          // Grid items
-          ];
-          
-          for (const selector of selectors) {
-            $(selector).each((i, el) => {
-              const $el = $(el);
-              
-              let title = $el.find('.ls4j h3 a, h3 a, h4 a, .title a').text().trim();
-              let link = $el.find('.ls4v a, .ls4j h3 a, h3 a, h4 a, .title a').attr('href');
-              let image = $el.find('.ls4v img, img').attr('data-src') || 
-                         $el.find('.ls4v img, img').attr('src');
-              
-              if (!title) title = $el.find('a').first().attr('title') || $el.find('img').attr('alt') || '';
-              if (!link) link = $el.find('a').first().attr('href');
-              if (!image) {
-                image = $el.find('img').attr('data-lazy-src') || 
-                       $el.find('img').attr('data-original') ||
-                       $el.find('img').attr('srcset');
-              }
-              
-              if (image && image.includes(',')) {
-                image = image.split(',')[0].trim();
-              }
-              
-              const chapter = $el.find('.ls24, .chapter, .new-chapter, .latest').text().trim();
-              const rating = $el.find('.rating, .score, .stars').text().trim();
-              const genre = $el.find('.genre, .categories, .cat, .tags').text().trim();
-              const status = $el.find('.status, .completed, .ongoing, .up, .down').text().trim();
-              
-              if (title && link && title.length > 2 && 
-                  (link.includes('/manga/') || link.includes('/komik/'))) {
-                comics.push({
-                  title: title.substring(0, 100),
-                  link: link.startsWith('http') ? link : `https://komiku.org${link}`,
-                  image: (image && image.startsWith('http')) ? image : 
-                         image ? `https://komiku.org${image}` : 
-                         'https://via.placeholder.com/200x300?text=No+Image',
-                  chapter: chapter || 'Latest',
-                  rating: rating || null,
-                  genre: genre || null,
-                  status: status || null,
-                  source: url,
-                  selector_used: selector,
-                  fetched_at: new Date().toISOString()
-                });
-              }
-            });
-            
-            if (comics.length > 0) break;
-          }
+          const $ = await fetchKomikuPage(url, 12000);
+          const comics = extractComicsFromPage($)
+            .filter((c) => c.link.includes('/manga/') || c.link.includes('/komik/'))
+            .map((c) => ({
+              title: c.title.substring(0, 100),
+              link: c.link,
+              image: c.image,
+              chapter: c.chapter,
+              rating: null,
+              genre: null,
+              status: null,
+              source: url,
+              selector_used: 'extractComicsFromPage',
+              fetched_at: new Date().toISOString(),
+            }));
           
           console.log(`Unlimited v2: ${url} -> ${comics.length} comics`);
           return comics;
@@ -855,32 +791,14 @@ app.get('/api/scroll', async (req, res) => {
     
     for (const url of sources) {
       try {
-        const response = await axios.get(url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-          },
-          timeout: 8000
-        });
-        const $ = cheerio.load(response.data);
-
-        $('.ls4, .bge, .bgei, .ltst').each((i, el) => {
-          const $el = $(el);
-          const title = $el.find('h3 a, h4 a').text().trim();
-          const link = $el.find('h3 a, h4 a').attr('href');
-          const image = $el.find('img').attr('src') || $el.find('img').attr('data-src');
-          const chapter = $el.find('.chapter, .ls24').text().trim();
-          
-          if (title && link && image) {
-            allComics.push({
-              title,
-              link,
-              image,
-              chapter: chapter || 'Latest',
-              scroll_position: offsetNum + allComics.length,
-              batch_id: Math.floor(offsetNum / batchSize),
-              source_page: url
-            });
-          }
+        const batch = await fetchComicsFromUrl(url, 8000);
+        batch.forEach((comic) => {
+          allComics.push({
+            ...comic,
+            scroll_position: offsetNum + allComics.length,
+            batch_id: Math.floor(offsetNum / batchSize),
+            source_page: url,
+          });
         });
       } catch (error) {
         console.log(`Scroll source failed: ${url}`);
@@ -931,13 +849,14 @@ app.get('/api/scroll', async (req, res) => {
 
 app.get('/api/fullstats', async (req, res) => {
   try {
+    const apiBase = getApiBase(req);
     const endpointTests = [
-      { name: 'terbaru', url: 'http://localhost:3000/api/terbaru?limit=5' },
-      { name: 'populer', url: 'http://localhost:3000/api/populer?limit=5' },
-      { name: 'infinite', url: 'http://localhost:3000/api/infinite?page=1&limit=5' },
-      { name: 'realtime', url: 'http://localhost:3000/api/realtime?count=5' },
-      { name: 'trending', url: 'http://localhost:3000/api/trending?limit=5' },
-      { name: 'browse', url: 'http://localhost:3000/api/browse?limit=5' }
+      { name: 'terbaru', url: `${apiBase}/api/terbaru?limit=5` },
+      { name: 'populer', url: `${apiBase}/api/populer?limit=5` },
+      { name: 'infinite', url: `${apiBase}/api/infinite?page=1&limit=5` },
+      { name: 'realtime', url: `${apiBase}/api/realtime?count=5` },
+      { name: 'trending', url: `${apiBase}/api/trending?limit=5` },
+      { name: 'browse', url: `${apiBase}/api/browse?limit=5` }
     ];
     
     const results = {};
@@ -992,17 +911,25 @@ app.get('/api/comparison', async (req, res) => {
     const websiteData = [];
     
     $('article.ls4').slice(0, 20).each((i, el) => { 
-      const title = $(el).find('.ls4j h3 a').text().trim();
-      const link = $(el).find('.ls4v a').attr('href');
+      const title = $(el).find('.ls4j h4 a, .ls4j h3 a').text().trim();
+      const link = $(el).find('.ls4v a, .ls4j h4 a').attr('href');
       if (title && link) {
         websiteData.push({ title, link });
       }
     });
     
-    const apiResponse = await axios.get('http://localhost:3000/api/unlimited?type=all&max_pages=2', {
-      timeout: 30000
-    });
-    const apiData = apiResponse.data.comics || [];
+    const unlimitedSources = [
+      'https://komiku.org/',
+      'https://komiku.org/pustaka/',
+      'https://api.komiku.org/manga/',
+    ];
+    let apiData = [];
+    for (const sourceUrl of unlimitedSources) {
+      const batch = await fetchComicsFromUrl(sourceUrl, 15000);
+      const map = new Map(apiData.map((c) => [c.link, c]));
+      batch.forEach((c) => map.set(c.link, c));
+      apiData = Array.from(map.values());
+    }
     
     const comparison = {
       website_scroll: {
@@ -1033,10 +960,11 @@ app.get('/api/comparison', async (req, res) => {
     };
     
     if (demo === 'true') {
+      const apiBase = getApiBase(req);
       const endpoints = [
-        { name: 'terbaru', url: 'http://localhost:3000/api/terbaru?limit=50' },
-        { name: 'realtime', url: 'http://localhost:3000/api/realtime?count=50' },
-        { name: 'unlimited', url: 'http://localhost:3000/api/unlimited?type=all&max_pages=1' }
+        { name: 'terbaru', url: `${apiBase}/api/terbaru?limit=50` },
+        { name: 'realtime', url: `${apiBase}/api/realtime?count=50` },
+        { name: 'unlimited', url: `${apiBase}/api/unlimited?type=all&max_pages=1` }
       ];
       
       const endpointResults = {};
@@ -1074,123 +1002,44 @@ app.get('/api/populer', cacheMiddleware(5 * 60 * 1000), async (req, res) => {
     const { page = 1, limit = 20 } = req.query;
     const maxLimit = Math.min(parseInt(limit), 50);
     
-    const urls = [
-      'https://komiku.org/pustaka/?orderby=meta_value_num',
-      'https://komiku.org/other/hot/',
-      'https://komiku.org/',
-      'https://komiku.org/pustaka/?orderby=meta_value_num&tipe=manga',
-      'https://komiku.org/pustaka/?orderby=meta_value_num&tipe=manhwa',
-      'https://komiku.org/pustaka/?orderby=meta_value_num&tipe=manhua'
+    const urlMeta = [
+      { url: 'https://komiku.org/other/hot/', popularity: 3, source: 'hot' },
+      { url: 'https://komiku.org/pustaka/?orderby=meta_value_num', popularity: 2, source: 'pustaka' },
+      { url: 'https://komiku.org/', popularity: 2, source: 'homepage' },
+      { url: 'https://komiku.org/pustaka/?orderby=meta_value_num&tipe=manga', popularity: 2, source: 'pustaka' },
+      { url: 'https://komiku.org/pustaka/?orderby=meta_value_num&tipe=manhwa', popularity: 2, source: 'pustaka' },
+      { url: 'https://komiku.org/pustaka/?orderby=meta_value_num&tipe=manhua', popularity: 2, source: 'pustaka' },
     ];
     
     let allComics = [];
     
-    for (const url of urls) {
+    for (const { url, popularity, source } of urlMeta) {
       try {
-        const response = await axios.get(url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        const batch = await fetchComicsFromUrl(url);
+        for (const comic of batch) {
+          if (allComics.length >= 100) break;
+          const exists = allComics.find((c) => c.link === comic.link);
+          if (!exists) {
+            allComics.push({
+              ...comic,
+              source,
+              popularity,
+            });
           }
-        });
-        const $ = cheerio.load(response.data);
-
-        if (url.includes('pustaka')) {
-          $('.bgei, .bge, .entry, article, .ls4').each((i, el) => {
-            const title = $(el).find('h3 a, h4 a, .title a').text().trim();
-            const link = $(el).find('h3 a, h4 a, .title a').attr('href');
-            const image = $(el).find('img').attr('src') || $(el).find('img').attr('data-src');
-            const chapter = $(el).find('.chapter, .ls24').text().trim();
-            
-            if (title && link && image && allComics.length < 100) {
-              const exists = allComics.find(c => c.link === link);
-              if (!exists) {
-                allComics.push({ 
-                  title, 
-                  link, 
-                  image, 
-                  chapter: chapter || 'Latest',
-                  source: 'pustaka',
-                  popularity: url.includes('meta_value_num') ? 2 : 1
-                });
-              }
-            }
-          });
-        } else if (url.includes('other/hot')) {
-          $('.hot .ls1, .daftar .bge, .ls4, .bge').each((i, el) => {
-            const title = $(el).find('h4 a, h3 a').text().trim();
-            const link = $(el).find('h4 a, h3 a').attr('href');
-            const image = $(el).find('img').attr('src') || $(el).find('img').attr('data-src');
-            const chapter = $(el).find('.ls1r a, .chapter').first().text().trim();
-            
-            if (title && link && image && allComics.length < 100) {
-              const exists = allComics.find(c => c.link === link);
-              if (!exists) {
-                allComics.push({ 
-                  title, 
-                  link, 
-                  image, 
-                  chapter: chapter || 'Hot',
-                  source: 'hot',
-                  popularity: 3
-                });
-              }
-            }
-          });
-        } else {
-          $('.populer .ls1, .hot .ls1, .ranktainer .ls1').each((i, el) => {
-            const title = $(el).find('h4 a, h3 a').text().trim();
-            const link = $(el).find('h4 a, h3 a').attr('href');
-            const image = $(el).find('img').attr('src') || $(el).find('img').attr('data-src');
-            const chapter = $(el).find('.ls1r a, .chapter').first().text().trim();
-            
-            if (title && link && image && allComics.length < 100) {
-              const exists = allComics.find(c => c.link === link);
-              if (!exists) {
-                allComics.push({ 
-                  title, 
-                  link, 
-                  image, 
-                  chapter: chapter || 'Popular',
-                  source: 'homepage_popular',
-                  popularity: 2
-                });
-              }
-            }
-          });
         }
-        
-        if (allComics.length >= 80) break; 
+        if (allComics.length >= 80) break;
       } catch (error) {
         console.log(`Failed to fetch from ${url}:`, error.message);
-        continue;
       }
     }
 
     if (allComics.length === 0) {
-      const latestResponse = await axios.get('https://komiku.org/', {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-      });
-      const $ = cheerio.load(latestResponse.data);
-      
-      $('.ls4').slice(0, 30).each((i, el) => {
-        const title = $(el).find('h3 a').text().trim();
-        const link = $(el).find('h3 a').attr('href');
-        const image = $(el).find('img').attr('data-src') || $(el).find('img').attr('src');
-        const chapter = $(el).find('.ls24').text().trim();
-        
-        if (title && link && image) {
-          allComics.push({ 
-            title, 
-            link, 
-            image,
-            chapter: chapter || 'Latest',
-            source: 'latest_as_popular',
-            popularity: 1
-          });
-        }
-      });
+      const fallback = await fetchComicsFromUrl('https://komiku.org/');
+      allComics = fallback.slice(0, 30).map((c) => ({
+        ...c,
+        source: 'latest_as_popular',
+        popularity: 1,
+      }));
     }
 
     allComics.sort((a, b) => b.popularity - a.popularity);
@@ -1217,67 +1066,23 @@ app.get('/api/populer', cacheMiddleware(5 * 60 * 1000), async (req, res) => {
 app.get('/api/terbaru', cacheMiddleware(3 * 60 * 1000), async (req, res) => {
   try {
     const { page = 1, limit = 20 } = req.query;
-    const maxLimit = Math.min(parseInt(limit), 50); 
-    
-    const response = await axios.get('https://komiku.org/', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
-    });
-    const $ = cheerio.load(response.data);
+    const maxLimit = Math.min(parseInt(limit), 50);
 
-    const comics = [];
-    $('.ls4').each((i, el) => {
-      const title = $(el).find('h3 a').text().trim();
-      const link = $(el).find('h3 a').attr('href');
-      const image = $(el).find('img').attr('data-src') || $(el).find('img').attr('src');
-      const chapter = $(el).find('a.ls24').text().trim();
-      if (title && link && image && chapter) {
-        comics.push({ title, link, image, chapter });
-      }
-    });
+    const sources = [
+      'https://komiku.org/',
+      'https://komiku.org/pustaka/?orderby=modified',
+      'https://komiku.org/pustaka/',
+    ];
 
-    if (comics.length < maxLimit) {
-      $('.hot .ls1, .ranktainer .ls1').each((i, el) => {
-        const title = $(el).find('h4 a, h3 a').text().trim();
-        const link = $(el).find('h4 a, h3 a').attr('href');
-        const image = $(el).find('img').attr('src') || $(el).find('img').attr('data-src');
-        const chapter = $(el).find('.ls1r a, .chapter').first().text().trim();
-        
-        if (title && link && image && comics.length < maxLimit) {
-          const exists = comics.find(c => c.link === link);
-          if (!exists) {
-            comics.push({ title, link, image, chapter: chapter || 'Latest', source: 'popular' });
-          }
-        }
+    let comics = [];
+    for (const sourceUrl of sources) {
+      const batch = await fetchComicsFromUrl(sourceUrl);
+      const map = new Map(comics.map((c) => [c.link, c]));
+      batch.forEach((c) => {
+        if (!map.has(c.link)) map.set(c.link, { ...c, source: sourceUrl.includes('pustaka') ? 'pustaka' : 'homepage' });
       });
-    }
-
-    if (comics.length < maxLimit) {
-      try {
-        const pustakaResponse = await axios.get('https://komiku.org/pustaka/', {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-          }
-        });
-        const $pustaka = cheerio.load(pustakaResponse.data);
-        
-        $pustaka('.ls4, .bge, .bgei').each((i, el) => {
-          const title = $pustaka(el).find('h3 a, h4 a').text().trim();
-          const link = $pustaka(el).find('h3 a, h4 a').attr('href');
-          const image = $pustaka(el).find('img').attr('src') || $pustaka(el).find('img').attr('data-src');
-          const chapter = $pustaka(el).find('.chapter, .ls24').text().trim();
-          
-          if (title && link && image && comics.length < maxLimit) {
-            const exists = comics.find(c => c.link === link);
-            if (!exists) {
-              comics.push({ title, link, image, chapter: chapter || 'Unknown', source: 'pustaka' });
-            }
-          }
-        });
-      } catch (error) {
-        console.log('Failed to fetch from pustaka:', error.message);
-      }
+      comics = Array.from(map.values());
+      if (comics.length >= maxLimit * parseInt(page)) break;
     }
 
     const startIndex = (parseInt(page) - 1) * maxLimit;
@@ -1317,11 +1122,13 @@ app.get('/api/comic/:slug', async (req, res) => {
 
     if (!title) {
         const pageTitle = $('title').text();
-        const titleMatch = pageTitle.match(/Baca (?:Manga|Manhwa|Manhua) (.*?) Bahasa Indonesia/);
+        const titleMatch =
+          pageTitle.match(/Baca (?:Manga|Manhwa|Manhua) (.*?) Bahasa Indonesia/) ||
+          pageTitle.match(/(?:Komik|Manga|Manhwa|Manhua)\s+(.+?)\s*-\s*Komiku/i);
         if (titleMatch && titleMatch[1]) {
           title = titleMatch[1].trim();
         } else {
-          title = $('h1.jdl').text().trim();
+          title = $('h1.jdl').text().trim() || $('h1').first().text().trim();
         }
     }
     
@@ -1381,52 +1188,27 @@ app.get('/api/search', async (req, res) => {
     let allComics = [];
 
     try {
-      const searchResponse = await axios.get(`https://komiku.org/?s=${encodeURIComponent(q)}`, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
-          'Accept-Encoding': 'gzip, deflate, br',
-          'DNT': '1',
-          'Connection': 'keep-alive',
-          'Upgrade-Insecure-Requests': '1'
-        }
-      });
-      
-      const $ = cheerio.load(searchResponse.data);
-      
-      const isSearchResults = !$('body').text().includes('Tidak ditemukan') && 
-                             !$('body').text().includes('No results found') &&
-                             !$('.no-results').length;
+      const $ = await fetchKomikuPage(`https://komiku.org/?s=${encodeURIComponent(q)}`);
+      const bodyText = $('body').text();
+      const isSearchResults =
+        !bodyText.includes('Tidak ditemukan') &&
+        !bodyText.includes('No results found') &&
+        !$('.no-results').length;
 
       if (isSearchResults) {
-        const selectors = ['.ls4', '.bge', '.bgei', 'article', '.search-result', '.result-item'];
-        
-        for (const selector of selectors) {
-          $(selector).each((i, el) => {
-            const $el = $(el);
-            const title = $el.find('h3 a, h4 a, .title a').text().trim();
-            const link = $el.find('h3 a, h4 a, .title a').attr('href');
-            const image = $el.find('img').attr('src') || $el.find('img').attr('data-src');
-            const chapter = $el.find('.chapter, .ls24, a[href*="chapter"]').text().trim();
-            
-            if (title && link && title.toLowerCase().includes(q.toLowerCase())) {
-              const exists = allComics.find(c => c.link === link);
-              if (!exists && allComics.length < 100) {
-                allComics.push({
-                  title,
-                  link,
-                  image: image || 'https://komiku.org/asset/img/no-image.png',
-                  chapter: chapter || 'Unknown',
-                  source: 'search',
-                  relevance: title.toLowerCase().indexOf(q.toLowerCase()) === 0 ? 2 : 1
-                });
-              }
-            }
-          });
-          
-          if (allComics.length >= 20) break;
-        }
+        const query = q.toLowerCase();
+        extractComicsFromPage($).forEach((comic) => {
+          const haystack = `${comic.title} ${comic.link}`.toLowerCase();
+          if (!haystack.includes(query)) return;
+          const exists = allComics.find((c) => c.link === comic.link);
+          if (!exists && allComics.length < 100) {
+            allComics.push({
+              ...comic,
+              source: 'search',
+              relevance: comic.title.toLowerCase().indexOf(query) === 0 ? 2 : 1,
+            });
+          }
+        });
       }
     } catch (error) {
       console.log('Search method 1 failed:', error.message);
@@ -1441,31 +1223,17 @@ app.get('/api/search', async (req, res) => {
         ];
 
         for (const url of sources) {
-          const response = await axios.get(url, {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-          });
-          const $ = cheerio.load(response.data);
-
-          $('.ls4, .bge, .bgei').each((i, el) => {
-            const title = $(el).find('h3 a, h4 a').text().trim();
-            const link = $(el).find('h3 a, h4 a').attr('href');
-            const image = $(el).find('img').attr('src') || $(el).find('img').attr('data-src');
-            const chapter = $(el).find('.chapter, .ls24').text().trim();
-
-            if (title && link && title.toLowerCase().includes(q.toLowerCase())) {
-              const exists = allComics.find(c => c.link === link);
-              if (!exists && allComics.length < 100) {
-                allComics.push({
-                  title,
-                  link,
-                  image: image || 'https://komiku.org/asset/img/no-image.png',
-                  chapter: chapter || 'Unknown',
-                  source: 'manual_filter',
-                  relevance: title.toLowerCase().indexOf(q.toLowerCase()) === 0 ? 2 : 1
-                });
-              }
+          const query = q.toLowerCase();
+          const batch = await fetchComicsFromUrl(url);
+          batch.forEach((comic) => {
+            if (!comic.title.toLowerCase().includes(query)) return;
+            const exists = allComics.find((c) => c.link === comic.link);
+            if (!exists && allComics.length < 100) {
+              allComics.push({
+                ...comic,
+                source: 'manual_filter',
+                relevance: comic.title.toLowerCase().indexOf(query) === 0 ? 2 : 1,
+              });
             }
           });
 
@@ -1660,15 +1428,13 @@ app.get('/api/homepage', async (req, res) => {
       }
     });
 
-    $('.ls4').each((i, el) => {
-      const title = $(el).find('h3 a').text().trim();
-      const link = $(el).find('h3 a').attr('href');
-      const image = $(el).find('img').attr('data-src') || $(el).find('img').attr('src');
-      const chapter = $(el).find('a.ls24').text().trim();
-      
-      if (title && link && image && chapter) {
-        data.latest.push({ title, link, image, chapter });
-      }
+    extractComicsFromPage($).forEach((comic) => {
+      data.latest.push({
+        title: comic.title,
+        link: comic.link,
+        image: comic.image,
+        chapter: comic.chapter,
+      });
     });
 
     res.json(data);
@@ -2421,7 +2187,7 @@ app.get('/api/docs', (req, res) => {
       title: "Komik API Documentation",
       version: "2.0.0",
       description: "RESTful API untuk mengakses ribuan komik dari Komiku.org",
-      base_url: `http://localhost:${PORT}`,
+      base_url: getApiBase(req),
       endpoints: {
         basic_endpoints: [
           {
